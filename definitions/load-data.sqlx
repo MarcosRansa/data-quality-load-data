@@ -1,0 +1,168 @@
+config {
+    type: "view", // Crear vista para extraer las ejecuciones correctas/erroneas
+    columns: {
+        ID_EJECUCION: "El ID de la ejecución", // Column descriptions are pushed to BigQuery.
+        NOMBRE_FUNCION: "Nombre de la Cloud Function",
+        TABLA: "Nombre de la tabla de destino",
+        PROYECTO: "Proyecto al que pertenece la Cloud Function (ejecución)",
+        TIPO_EJECUCION: "Tipo de la ejeción: Correcta / Error",
+        REGISTROS_CARGADOS: "Cantidad de registros cargados en la ejecución",
+        TIPO_ERROR: "Tipo de error identificado",
+        FECHA_EJECUCION: "Fecha de la ejcución",
+        TEXT_LOG: "Log recolectado",
+        TRACE: "ID del trace de la ejecución"
+    }
+}
+
+WITH
+  tabla_execution_id_200 AS (
+  SELECT
+    DISTINCT cf.labels.execution_id
+  FROM
+    `pe-gromero-ransa-datalake.GOBERNANZA.cloudfunctions_googleapis_com_cloud_functions` cf
+  WHERE
+    cf.resource.type = 'cloud_function'
+    AND TIMESTAMP_TRUNC(timestamp, DAY) >= TIMESTAMP('2024-08-02')
+    AND (cf.textPayload LIKE "%finished with status code: 200%"
+      OR cf.textPayload LIKE "%finished with status code: 250%"
+      OR cf.textPayload LIKE "%finished with status: 'ok'")
+    AND (cf.resource.labels.function_name LIKE 'api-otd-%-v3'
+      OR cf.resource.labels.function_name LIKE 'api-fillrate-unigis-%-v2'
+      OR cf.resource.labels.function_name LIKE 'activate-prd-landing%infor%'
+      OR cf.resource.labels.function_name LIKE 'api-infor-etl%') ),
+  tabla_execution_id_500 AS (
+  SELECT
+    DISTINCT cf.labels.execution_id
+  FROM
+    `pe-gromero-ransa-datalake.GOBERNANZA.cloudfunctions_googleapis_com_cloud_functions` cf
+  WHERE
+    cf.resource.type = 'cloud_function'
+    AND TIMESTAMP_TRUNC(timestamp, DAY) >= TIMESTAMP('2024-08-02')
+    AND (cf.textPayload LIKE "%finished with status: 'timeout'%"
+      OR cf.textPayload LIKE "%finished with status code: 500")
+    AND (cf.resource.labels.function_name LIKE 'api-otd-%-v3'
+      OR cf.resource.labels.function_name LIKE 'api-fillrate-unigis-%-v2'
+      OR cf.resource.labels.function_name LIKE 'activate-prd-landing%infor%'
+      OR cf.resource.labels.function_name LIKE 'api-infor-etl%') ),
+  tabla_logs_200 AS (
+  SELECT
+    cf.labels.execution_id AS ID_EJECUCION,
+    cf.resource.labels.function_name AS NOMBRE_FUNCION,
+    CAST(NULL AS STRING) AS TIPO_ERROR,
+    CASE
+      WHEN cf.textPayload LIKE 'GOBERNANZA|%' AND cf.resource.labels.function_name LIKE '%unigis%' THEN SPLIT(cf.textPayload, '|')[SAFE_OFFSET(2)]
+      WHEN cf.textPayload LIKE 'GOBERNANZA|%'
+    AND cf.resource.labels.function_name LIKE '%infor%' THEN SPLIT(cf.textPayload, '|')[SAFE_OFFSET(2)]
+      WHEN cf.textPayload LIKE "Tabla: %" AND cf.resource.labels.function_name = 'activate-prd-landing-talend-infor' THEN SPLIT(cf.textPayload, '|')[SAFE_OFFSET(1)]
+      WHEN cf.textPayload LIKE "Tabla: %"
+    AND cf.resource.labels.function_name = 'activate-prd-landing-infor-v2' THEN SPLIT(cf.textPayload, '|')[SAFE_OFFSET(1)]
+      WHEN cf.textPayload LIKE "Tabla: %" AND cf.resource.labels.function_name = 'api-infor-etl' THEN CONCAT('INFOR.',SPLIT(cf.textPayload, ' ')[SAFE_OFFSET(1)])
+      WHEN cf.textPayload LIKE "Tabla: %"
+    AND cf.resource.labels.function_name = 'api-infor-etl-v2' THEN CONCAT('INFOR_PRD.',SPLIT(cf.textPayload, ' ')[SAFE_OFFSET(1)])
+      ELSE "TABLA DESCONOCIDA"
+  END
+    AS TABLA,
+    CASE
+      WHEN cf.textPayload LIKE 'GOBERNANZA|%' AND cf.resource.labels.function_name LIKE '%unigis%' THEN SPLIT(cf.textPayload, '|')[SAFE_OFFSET(1)]
+      WHEN cf.resource.labels.function_name LIKE '%infor%' THEN 'INFOR'
+      ELSE 'PROYECTO NO IDENTIFICADO'
+  END
+    AS PROYECTO,
+    CASE
+      WHEN cf.textPayload LIKE 'GOBERNANZA|%' AND CAST(SPLIT(cf.textPayload, '|')[SAFE_OFFSET(3)] AS INT64) = 0 THEN 'ADVERTENCIA'
+      WHEN cf.textPayload LIKE 'GOBERNANZA|%'
+    AND CAST(SPLIT(cf.textPayload, '|')[SAFE_OFFSET(3)] AS INT64) > 0 THEN 'CORRECTO'
+      ELSE 'TIPO EJECUCION DESCONOCIDO'
+  END
+    AS TIPO_EJECUCION,
+    CASE
+      WHEN cf.textPayload LIKE 'GOBERNANZA|%' THEN CAST(SPLIT(cf.textPayload, '|')[SAFE_OFFSET(3)] AS INT64)
+      ELSE NULL
+  END
+    AS REGISTROS_CARGADOS,
+    cf.textPayload AS TEXT_LOG,
+    cf.timestamp AS FECHA_EJECUCION,
+    cf.trace AS TRACE
+  FROM
+    `pe-gromero-ransa-datalake.GOBERNANZA.cloudfunctions_googleapis_com_cloud_functions` cf
+  WHERE
+    labels.execution_id IN (
+    SELECT
+      *
+    FROM
+      tabla_execution_id_200)
+    AND TIMESTAMP_TRUNC(timestamp, DAY) >= TIMESTAMP('2024-08-02')
+    AND cf.textPayload LIKE 'GOBERNANZA|%'
+    AND cf.textPayload NOT LIKE 'GOBERNANZA|TABLA|%' ),
+  tabla_logs_500 AS (
+  SELECT
+    cf.labels.execution_id AS ID_EJECUCION,
+    cf.resource.labels.function_name AS NOMBRE_FUNCION,
+    CASE
+      WHEN cf.textPayload LIKE 'GOBERNANZA|%' AND cf.resource.labels.function_name LIKE '%unigis%' THEN "TIMEOUT"
+      WHEN cf.textPayload LIKE "Tabla: %"
+    AND cf.resource.labels.function_name LIKE 'api-infor-etl%' THEN "CONECTOR CAIDO"
+      WHEN cf.textPayload LIKE "Tabla: %" AND cf.resource.labels.function_name LIKE 'activate-prd-landing%infor%' THEN "TIMEOUT"
+      ELSE "ERROR NO MAPEADO"
+  END
+    AS TIPO_ERROR,
+    CASE
+      WHEN cf.textPayload LIKE 'GOBERNANZA|%' AND cf.resource.labels.function_name LIKE '%unigis%' THEN SPLIT(cf.textPayload, '|')[SAFE_OFFSET(2)]
+      WHEN cf.textPayload LIKE "Tabla: %"
+    AND cf.resource.labels.function_name = 'activate-prd-landing-talend-infor' THEN CONCAT('INFOR.',SPLIT(cf.textPayload, ' ')[SAFE_OFFSET(1)])
+      WHEN cf.textPayload LIKE "Tabla: %" AND cf.resource.labels.function_name = 'activate-prd-landing-infor-v2' THEN CONCAT('INFOR_PRD.',SPLIT(cf.textPayload, ' ')[SAFE_OFFSET(1)])
+      WHEN cf.textPayload LIKE "Tabla: %"
+    AND cf.resource.labels.function_name = 'api-infor-etl' THEN CONCAT('INFOR.',SPLIT(cf.textPayload, ' ')[SAFE_OFFSET(1)])
+      WHEN cf.textPayload LIKE "Tabla: %" AND cf.resource.labels.function_name = 'api-infor-etl-v2' THEN CONCAT('INFOR_PRD.',SPLIT(cf.textPayload, ' ')[SAFE_OFFSET(1)])
+      ELSE "TABLA DESCONOCIDA"
+  END
+    AS TABLA,
+    CASE
+      WHEN cf.textPayload LIKE 'GOBERNANZA|%' AND cf.resource.labels.function_name LIKE '%unigis%' THEN SPLIT(cf.textPayload, '|')[SAFE_OFFSET(1)]
+      WHEN cf.resource.labels.function_name LIKE '%infor%' THEN 'INFOR'
+      ELSE 'PROYECTO NO IDENTIFICADO'
+  END
+    AS PROYECTO,
+    'ERROR' AS TIPO_EJECUCION,
+    CAST(NULL AS INT64) AS REGISTROS_CARGADOS,
+    cf.textPayload AS TEXT_LOG,
+    cf.timestamp AS FECHA_EJECUCION,
+    cf.trace AS TRACE
+  FROM
+    `pe-gromero-ransa-datalake.GOBERNANZA.cloudfunctions_googleapis_com_cloud_functions` cf
+  WHERE
+    labels.execution_id IN (
+    SELECT
+      *
+    FROM
+      tabla_execution_id_500)
+    AND TIMESTAMP_TRUNC(timestamp, DAY) >= TIMESTAMP('2024-08-02')
+    AND (cf.textPayload LIKE 'Tabla: %'
+      OR cf.textPayload LIKE 'GOBERNANZA|%') )
+SELECT
+  t200.ID_EJECUCION,
+  t200.NOMBRE_FUNCION,
+  t200.TABLA,
+  t200.PROYECTO,
+  t200.TIPO_EJECUCION,
+  t200.REGISTROS_CARGADOS,
+  t200.TIPO_ERROR,
+  t200.FECHA_EJECUCION,
+  t200.TEXT_LOG,
+  t200.TRACE
+FROM
+  tabla_logs_200 t200
+UNION ALL
+SELECT
+  t500.ID_EJECUCION,
+  t500.NOMBRE_FUNCION,
+  t500.TABLA,
+  t500.PROYECTO,
+  t500.TIPO_EJECUCION,
+  t500.REGISTROS_CARGADOS,
+  t500.TIPO_ERROR,
+  t500.FECHA_EJECUCION,
+  t500.TEXT_LOG,
+  t500.TRACE
+FROM
+  tabla_logs_500 t500
